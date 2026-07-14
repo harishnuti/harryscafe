@@ -1,0 +1,13 @@
+[build]
+  publish = "dist"
+  command = "npm run build"
+  functions = "netlify/functions"
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Content-Security-Policy = "default-src 'self'; connect-src 'self' https://places.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; script-src 'self'"
+    X-Content-Type-Options = "nosniff"
