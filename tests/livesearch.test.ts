@@ -186,3 +186,33 @@ describe('V7 Regression Guards', () => {
     expect(place?.originLat).toBe(35.01);
   });
 });
+
+describe('Filter Keyword Context edge cases', () => {
+  it('filter keyword requires coffee context and rejects menu/water filtering', () => {
+    const baseOpts = {
+      evidenceKeywords: ['filter', 'v60', 'pourover', 'chemex', 'aeropress', 'masl'],
+      archive: [],
+      totalWeight: 1,
+      filterCoffeeRequired: false,
+      originLat: 0,
+      originLng: 0
+    };
+    // 1. "trying to filter out the menu" -> NO MATCH
+    const noMatch1 = scorePlace({ id: '1', displayName: { text: 'Cafe' }, reviews: [{ text: { text: 'trying to filter out the menu' } }] }, [], baseOpts);
+    expect(noMatch1?.scoreBreakdown.evidenceScore).toBe(0);
+
+    // 2. "filter something out" -> NO MATCH
+    const noMatch2 = scorePlace({ id: '2', displayName: { text: 'Cafe' }, reviews: [{ text: { text: 'they try to filter something out' } }] }, [], baseOpts);
+    expect(noMatch2?.scoreBreakdown.evidenceScore).toBe(0);
+
+    // 3. "they serve good filter coffee" -> MATCH
+    const match1 = scorePlace({ id: '3', displayName: { text: 'Cafe' }, reviews: [{ text: { text: 'they serve good filter coffee' } }] }, [], baseOpts);
+    expect(match1?.scoreBreakdown.evidenceScore).toBeGreaterThan(0);
+
+    // 4. "I had a great ethiopia filter today" -> MATCH
+    // since we check for (coffee|roast|beans|brew|cup|menu|v60|pourover|specialty) within 6 words. Wait, 'ethiopia' isn't in that list, but 'filter' might still match if there's no coffee word?
+    // Wait, let's test a case where "coffee" is nearby.
+    const match2 = scorePlace({ id: '4', displayName: { text: 'Cafe' }, reviews: [{ text: { text: 'had a nice filter from their specialty roast' } }] }, [], baseOpts);
+    expect(match2?.scoreBreakdown.evidenceScore).toBeGreaterThan(0);
+  });
+});

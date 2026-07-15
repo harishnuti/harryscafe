@@ -169,7 +169,12 @@ export function scorePlace(raw: RawPlace, matched: string[], opts: {
     for (const kw of opts.evidenceKeywords) {
       const isWordBoundaryNeeded = ['filter', 'masl'].includes(kw);
       let found = false;
-      if (isWordBoundaryNeeded) {
+      if (kw === 'filter') {
+        found = /\bfilter\b/i.test(combinedText) && 
+                !/\bfilter(ed)? water\b/i.test(combinedText) && 
+                !/\bfilter(ing)? (something )?out\b/i.test(combinedText) &&
+                /\b(coffee|roast|beans|brew|cup|menu|v60|pourover|specialty)\W+(?:\w+\W+){0,6}filter\b|\bfilter\W+(?:\w+\W+){0,6}(coffee|roast|beans|brew|cup|menu|v60|pourover|specialty)\b/i.test(combinedText);
+      } else if (isWordBoundaryNeeded) {
         found = new RegExp(`\\b${kw}\\b`, 'i').test(combinedText);
       } else {
         found = combinedText.includes(kw.toLowerCase());
