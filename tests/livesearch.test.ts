@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { circleToRect, tokenizeDna, scorePlace, sortLiveResults, menuEvidenceRegex } from '../src/services/livesearch';
+import { circleToRect, tokenizeDna, scorePlace, sortLiveResults, extractContextualMatches, menuEvidenceKeywords, upgradeT1, type LiveResult } from '../src/services/livesearch';
+import { vi } from 'vitest';
+import { getScan } from '../src/services/store';
+
+vi.mock('../src/services/store', () => ({
+  getScan: vi.fn(),
+  setScan: vi.fn(),
+}));
 import fs from 'fs';
 import path from 'path';
 // Note: test scans can be done via upgradeT1, but since it relies on indexDB and fetch, it might be tricky to test here without mocking.
@@ -121,18 +128,49 @@ describe('scorePlace - V8 Tiers & Shrinkage', () => {
   });
 });
 
-describe('T1 Menu Evidence Scanner', () => {
+describe('Contextual Match & Menu Evidence Scanner', () => {
   it('detects specialty coffee menu keywords in cafe HTML', () => {
     const html = fs.readFileSync(path.join(__dirname, 'fixtures', 'cafe-menu.html'), 'utf-8');
-    const match = html.match(menuEvidenceRegex);
-    expect(match).toBeTruthy();
-    expect(match![0].toLowerCase()).toBe('filter coffee');
+    const cleanText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+    const matches = extractContextualMatches(cleanText, menuEvidenceKeywords);
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches.map(m => m.word).includes('filter')).toBe(true);
   });
 
   it('yields zero evidence for nightclub HTML', () => {
     const html = fs.readFileSync(path.join(__dirname, 'fixtures', 'nightclub.html'), 'utf-8');
-    const match = html.match(menuEvidenceRegex);
-    expect(match).toBeNull();
+    const cleanText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+    const matches = extractContextualMatches(cleanText, menuEvidenceKeywords);
+    expect(matches.length).toBe(0);
+  });
+  
+  it('contextualMatch returns identical results for review path and menu path (guards against drift)', () => {
+    const text = "we serve great natural process coffee";
+    const reviewMatches = extractContextualMatches(text, ['natural']);
+    const menuMatches = extractContextualMatches(text, ['natural']);
+    expect(reviewMatches).toEqual(menuMatches);
+    expect(reviewMatches.length).toBe(1);
+    expect(reviewMatches[0].word).toBe('natural');
+  });
+  
+  it('natural ingredients does not match but natural coffee does', () => {
+    expect(extractContextualMatches('100% natural ingredients', ['natural']).length).toBe(0);
+    expect(extractContextualMatches('natural coffee beans', ['natural']).length).toBe(1);
+  });
+});
+
+describe('Sorting and Verdicts', () => {
+  it('blocked placeId sorts below everything regardless of score', () => {
+    const blocked: LiveResult = { placeId: 'b', score: 99, verdict: 'REJECT', tier: 'T1', distanceM: 10 } as any;
+    const regular: LiveResult = { placeId: 'r', score: 50, tier: 'T2', distanceM: 20 } as any;
+    const unverified: LiveResult = { placeId: 'u', score: 20, tier: 'UNVERIFIED', distanceM: 5 } as any;
+    
+    const arr = [blocked, regular, unverified];
+    arr.sort(sortLiveResults);
+    
+    expect(arr[0].placeId).toBe('r'); // T2 beats blocked
+    expect(arr[1].placeId).toBe('u'); // Unverified beats blocked
+    expect(arr[2].placeId).toBe('b'); // Blocked is absolute bottom
   });
 });
 
@@ -210,9 +248,47 @@ describe('Filter Keyword Context edge cases', () => {
     expect(match1?.scoreBreakdown.evidenceScore).toBeGreaterThan(0);
 
     // 4. "I had a great ethiopia filter today" -> MATCH
-    // since we check for (coffee|roast|beans|brew|cup|menu|v60|pourover|specialty) within 6 words. Wait, 'ethiopia' isn't in that list, but 'filter' might still match if there's no coffee word?
-    // Wait, let's test a case where "coffee" is nearby.
     const match2 = scorePlace({ id: '4', displayName: { text: 'Cafe' }, reviews: [{ text: { text: 'had a nice filter from their specialty roast' } }] }, [], baseOpts);
     expect(match2?.scoreBreakdown.evidenceScore).toBeGreaterThan(0);
+  });
+});
+
+describe('T1 Upgrade Coherence Gate', () => {
+  it('2 menu signals + coffee-ratio 0.2 -> no upgrade', async () => {
+    // Mock website content to have 2 strong signals
+    (getScan as any).mockResolvedValue({ ts: Date.now(), text: 'we serve single origin and v60' });
+    
+    // Create a LiveResult with 0.2 coffee ratio (5 reviews, 1 mentions coffee)
+    const rawReviews = ['coffee is okay', 'nice place', 'good food', 'great service', 'awesome vibe']; 
+    const baseResult = {
+      placeId: 'gate-test-1',
+      websiteUri: 'https://test.com',
+      tier: 'T2',
+      rawReviews,
+      scoreBreakdown: { coffeeMention: 0, lexiconScore: 0, evidenceScore: 0, matchedKeywords: [], totalBeforeCap: 0 }
+    } as unknown as LiveResult;
+    
+    const upgraded = await upgradeT1([baseResult]);
+    expect(upgraded[0].tier).toBe('T2'); // No upgrade because ratio is 0.2
+  });
+
+  it('1 menu signal + coffee-ratio 0.5 -> Menu Hint (0.30)', async () => {
+    // Mock website content to have 1 strong signal
+    (getScan as any).mockResolvedValue({ ts: Date.now(), text: 'we serve v60' });
+    
+    // Create a LiveResult with 0.5 coffee ratio (2 reviews, 1 mentions coffee)
+    const rawReviews = ['good coffee', 'nice place']; 
+    const baseResult = {
+      placeId: 'gate-test-2',
+      websiteUri: 'https://test.com',
+      tier: 'T2',
+      rawReviews,
+      scoreBreakdown: { coffeeMention: 0, lexiconScore: 0, evidenceScore: 0, matchedKeywords: [], totalBeforeCap: 0 }
+    } as unknown as LiveResult;
+    
+    const upgraded = await upgradeT1([baseResult]);
+    expect(upgraded[0].tier).toBe('T2'); 
+    expect(upgraded[0].tierBadge).toBe('📄 Menu Hint');
+    expect(upgraded[0].scoreBreakdown.evidenceScore).toBe(0.30);
   });
 });

@@ -8,12 +8,12 @@ export interface Examination { id: string; cafeName: string; placeId?: string; d
 export interface CachedSearch { id: string; ts: number; originLat: number; originLng: number; radius: number; keywords: string[]; results: ScoredPlace[]; areaLabel: string }
 export interface ScoredPlace { placeId: string; name: string; address: string; lat: number; lng: number; rating: number|null; reviews: number; openNow: boolean|null; primaryType: string; score: number; matched: string[]; concepts: string[]; distanceM: number; bonuses: string[]; breakdown: string }
 
-const DB = 'gatekeeper'; const V = 2;
+const DB = 'gatekeeper'; const V = 3;
 let dbp: Promise<IDBPDatabase> | null = null;
 function db() {
   if (!dbp) dbp = openDB(DB, V, { upgrade(d) {
-    for (const s of ['settings','keywords','criteria','wishlist','audits','searches','examinations', 'scans'])
-      if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: s==='settings' ? 'key' : 'id' });
+    for (const s of ['settings','keywords','criteria','wishlist','audits','searches','examinations', 'scans', 'verdicts'])
+      if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: s==='settings' ? 'key' : (s==='verdicts' ? 'placeId' : 'id') });
   }});
   return dbp;
 }
@@ -50,4 +50,18 @@ export async function migrateV2() {
     if (Array.isArray(audits)) for (const a of audits) await put('audits', { id: uid(), capturedAt: new Date().toISOString(), ...a });
     localStorage.setItem('gk_migrated', '1');
   } catch { /* storage unavailable — fine */ }
+}
+
+export type Verdict = 'REJECT' | 'APPROVE';
+export interface VerdictRec { placeId: string; verdict: Verdict; ts: number; }
+
+export async function getVerdicts(): Promise<Record<string, VerdictRec>> {
+  const arr = await getAll<VerdictRec>('verdicts');
+  const dict: Record<string, VerdictRec> = {};
+  for (const r of arr) dict[r.placeId] = r;
+  return dict;
+}
+
+export async function setVerdict(placeId: string, verdict: Verdict) {
+  await put('verdicts', { placeId, verdict, ts: Date.now() });
 }

@@ -1,8 +1,8 @@
 import { signal } from '@preact/signals';
 import { toast, goAudit, tab, unifiedData } from '../state';
 import { fmtDist, gmapsLink, amapsLink } from '../services/places';
-import { getSetting } from '../services/store';
-import { liveAreaSearch, PlacesError, upgradeT1, extractDna, type LiveResult } from '../services/livesearch';
+import { getSetting, getVerdicts, setVerdict, type Verdict } from '../services/store';
+import { liveAreaSearch, PlacesError, upgradeT1, extractDna, sortLiveResults, type LiveResult } from '../services/livesearch';
 import { gateCandidate } from './gate';
 
 const radiusM = signal(3000);
@@ -25,6 +25,19 @@ function placesErrMsg(e: PlacesError): string {
   }[e.kind];
 }
 
+async function applyVerdict(v: LiveResult, verdict: Verdict) {
+  await setVerdict(v.placeId, verdict);
+  if (customResults.value) {
+    const arr = [...customResults.value];
+    const idx = arr.findIndex(r => r.placeId === v.placeId);
+    if (idx !== -1) {
+      arr[idx] = { ...arr[idx], verdict };
+      arr.sort(sortLiveResults);
+      customResults.value = arr;
+    }
+  }
+}
+
 async function runCustomSearch() {
   const area = customArea.value.trim();
   if (!area) { customErr.value = 'Type an area to search.'; return; }
@@ -33,9 +46,10 @@ async function runCustomSearch() {
   customErr.value = ''; customResults.value = null; customFailed.value = null;
   const apiKey = await getSetting('apiKey', '');
   if (!apiKey) { customErr.value = 'No API key configured — add it in Settings.'; return; }
+  const verdicts = await getVerdicts();
   customSearching.value = true;
   try {
-    const outcome = await liveAreaSearch({ apiKey, areaText: area, radiusM: radiusM.value, keywords: kws, lat: null, lng: null, filterCoffeeRequired: true, archive: unifiedData.value as any });
+    const outcome = await liveAreaSearch({ apiKey, areaText: area, radiusM: radiusM.value, keywords: kws, lat: null, lng: null, filterCoffeeRequired: true, archive: unifiedData.value as any, verdicts });
     customResults.value = outcome.results;
     if (outcome.failedKeywords && outcome.failedKeywords.length > 0 && outcome.results.length > 0) {
       customFailed.value = { failed: outcome.failedKeywords.length, total: kws.length };
@@ -45,7 +59,9 @@ async function runCustomSearch() {
     // Asynchronous T1 Menu Scanning
     if (outcome.results.length > 0) {
       upgradeT1(outcome.results).then(upgraded => {
-        customResults.value = upgraded;
+        // Must resort because upgradeT1 modifies tiers and scores
+        const sorted = [...upgraded].sort(sortLiveResults);
+        customResults.value = sorted;
       });
     }
 
@@ -117,7 +133,7 @@ export function Radar() {
           return (
           <div key={v.placeId}>
             {showDivider && <div style="margin: 1.5rem 0; text-align: center; color: var(--faint); font-size: 0.9rem;">— Unverified (no review evidence) —</div>}
-            <div class={'res' + (customOpenId.value === v.placeId ? ' open' : '')}>
+            <div class={'res' + (customOpenId.value === v.placeId ? ' open' : '')} style={v.verdict === 'REJECT' ? 'opacity: 0.6;' : ''}>
             <div onClick={() => customOpenId.value = customOpenId.value === v.placeId ? '' : v.placeId}>
               <div class="res-top">
                 <div>
@@ -130,7 +146,7 @@ export function Radar() {
                   </div>
                 </div>
                 <div class="res-score" onClick={(e) => { e.stopPropagation(); debugOpenId.value = debugOpenId.value === v.placeId ? '' : v.placeId; }} style="cursor:help" title="Click to view score breakdown">
-                  <b>{v.score}%</b><span>MATCH</span>
+                  <b style={v.verdict === 'REJECT' ? 'text-decoration: line-through;' : ''}>{v.score}%</b><span>MATCH</span>
                 </div>
               </div>
 
@@ -145,28 +161,41 @@ export function Radar() {
                   <div style="font-weight:bold; margin-bottom:.4rem; color:var(--text)">2. Google Queries Matched</div>
                   <div style="margin-bottom: .8rem;">{v.matched.join(', ')}</div>
 
-                  <div style="font-weight:bold; margin-bottom:.4rem; color:var(--text)">3. Base Score Breakdown</div>
-                  <div style="display:grid; grid-template-columns: 1fr auto; gap: .2rem; margin-bottom: .8rem;">
-                    <span>Base (Query match)</span><span>+{((v.scoreBreakdown?.base ?? 0) * 100).toFixed(1)}%</span>
-                    <span>Gem Lexicon Alignment</span><span>{(v.scoreBreakdown?.lexiconScore ?? 0) >= 0 ? '+' : ''}{((v.scoreBreakdown?.lexiconScore ?? 0) * 100).toFixed(1)}%</span>
-                    <span>Bayesian Rating Bonus</span><span>{((v.scoreBreakdown?.ratingBonus ?? 0) + (v.scoreBreakdown?.depthBonus ?? 0)) >= 0 ? '+' : ''}{(((v.scoreBreakdown?.ratingBonus ?? 0) + (v.scoreBreakdown?.depthBonus ?? 0)) * 100).toFixed(1)}%</span>
-                    <span>Type Score (Coffee vs Food/Bar)</span><span>{(v.scoreBreakdown?.typeScore ?? 0) > 0 ? '+' : ''}{((v.scoreBreakdown?.typeScore ?? 0) * 100).toFixed(1)}%</span>
-                    <span>Coffee-Mention Ratio</span><span>{(v.scoreBreakdown?.coffeeMention ?? 0) > 0 ? '+' : ''}{((v.scoreBreakdown?.coffeeMention ?? 0) * 100).toFixed(1)}%</span>
-                    <span>Name Signal</span><span>{(v.scoreBreakdown?.nameBonus ?? 0) > 0 ? '+' : ''}{((v.scoreBreakdown?.nameBonus ?? 0) * 100).toFixed(1)}%</span>
+                  <div style="font-weight:bold; margin-bottom:.4rem; color:var(--text)">3. Score Math</div>
+                  <div style="margin-bottom: 1rem; font-family: monospace; font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.4rem; border-radius: 4px;">
+                    Base {((v.scoreBreakdown?.base ?? 0) * 100).toFixed(1)}% + 
+                    Menu/Evidence {((v.scoreBreakdown?.evidenceScore ?? 0) * 100).toFixed(1)}% + 
+                    Coffee-mention {((v.scoreBreakdown?.coffeeMention ?? 0) * 100).toFixed(1)}% + 
+                    Rating {(((v.scoreBreakdown?.ratingBonus ?? 0) + (v.scoreBreakdown?.depthBonus ?? 0)) * 100).toFixed(1)}% + 
+                    Lexicon {((v.scoreBreakdown?.lexiconScore ?? 0) * 100).toFixed(1)}% + 
+                    Type {((v.scoreBreakdown?.typeScore ?? 0) * 100).toFixed(1)}% + 
+                    Name {((v.scoreBreakdown?.nameBonus ?? 0) * 100).toFixed(1)}% = 
+                    {((v.scoreBreakdown?.totalBeforeCap ?? 0) * 100).toFixed(1)}%
                   </div>
 
                   <div style="font-weight:bold; margin-bottom:.4rem; color:var(--text)">4. Specialty Keyword Evidence</div>
                   {v.scoreBreakdown?.matchedKeywords?.length === 0 ? (
                     <div style="margin-bottom: .8rem; font-style: italic; color: var(--fail);">No specialty coffee keywords found.</div>
                   ) : (
-                    <div style="display:grid; grid-template-columns: 1fr auto; gap: .2rem; margin-bottom: .8rem;">
-                      {v.scoreBreakdown?.matchedKeywords?.map((mk) => (
-                        <span style="color:var(--pass)">"{mk.word}"</span>
-                      ))}
-                      <div style="grid-column: 1 / -1; border-top: 1px solid var(--line2); margin-top: .2rem; padding-top: .2rem; display:flex; justify-content:space-between;">
-                        <span>Total Evidence Bonus</span>
-                        <span>+{((v.scoreBreakdown?.evidenceScore ?? 0) * 100).toFixed(1)}%</span>
-                      </div>
+                    <div style="margin-bottom: .8rem;">
+                      {v.scoreBreakdown?.matchedKeywords?.filter((m: any) => m.source === 'menu').length > 0 && (
+                        <div style="margin-bottom: 0.5rem;">
+                          <strong style="color:var(--text)">Menu Matches:</strong>
+                          {v.scoreBreakdown?.matchedKeywords?.filter((m: any) => m.source === 'menu').map((mk: any) => (
+                            <div style="margin-top: 0.2rem; padding-left: 0.5rem; border-left: 2px solid var(--pass); font-style: italic; color: var(--faint);">
+                              <span style="color:var(--pass)">"{mk.word}"</span> {mk.snippet ? `...${mk.snippet}...` : ''}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {v.scoreBreakdown?.matchedKeywords?.filter((m: any) => m.source === 'review').length > 0 && (
+                        <div>
+                          <strong style="color:var(--text)">Review Matches:</strong> 
+                          {v.scoreBreakdown?.matchedKeywords?.filter((m: any) => m.source === 'review').map((mk: any) => (
+                            <span style="color:var(--pass); margin-left: 0.4rem;">"{mk.word}"</span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -178,13 +207,14 @@ export function Radar() {
                   <div style="font-weight:bold; margin-bottom:.4rem; color:var(--text)">5. Unfiltered Raw Reviews ({v.rawReviews.length})</div>
                   {v.rawReviews.length === 0 ? <div>No text reviews provided by Google API.</div> : v.rawReviews.map((r) => (
                     <div style="margin-bottom: .4rem; padding-left: .5rem; border-left: 2px solid var(--line); font-style: italic; line-height: 1.4;">
-                      <HighlightedReview text={r} kws={v.scoreBreakdown?.matchedKeywords?.map(m => m.word) ?? []} />
+                      <HighlightedReview text={r} kws={v.scoreBreakdown?.matchedKeywords?.filter((m: any) => m.source === 'review').map((m: any) => m.word) ?? []} />
                     </div>
                   ))}
                 </div>
               )}
 
               <div class="badges" style="margin-top: .8rem;">
+                {v.verdict === 'REJECT' && <span class="badge" style="border-color:var(--fail);color:var(--fail)">⛔ You ruled this out</span>}
                 <span class="badge" style={`border-color:${v.tier !== 'UNVERIFIED' ? 'var(--pass)' : 'var(--fail)'};color:${v.tier !== 'UNVERIFIED' ? 'var(--pass)' : 'var(--fail)'}`}>{v.tierBadge}</span>
                 {v.scoreBreakdown?.typeScore === -0.25 && <span class="badge" style="border-color:var(--fail);color:var(--fail)">🍸 Nightlife</span>}
                 {v.scoreBreakdown?.typeScore !== -0.25 && v.foodHeavy && <span class="badge" style="border-color:var(--fail);color:var(--fail)">🍔 Food Heavy</span>}
@@ -201,6 +231,8 @@ export function Radar() {
                 <a class="btn small" href={gmapsLink(v)} target="_blank" rel="noopener">↗ Google Maps</a>
                 <a class="btn small ghost" href={amapsLink(v)} target="_blank" rel="noopener">Apple Maps</a>
                 {v.websiteUri && <a class="btn small ghost" href={v.websiteUri} target="_blank" rel="noopener">🌐 Website</a>}
+                <button class="btn small ghost" onClick={() => applyVerdict(v, 'APPROVE')}>👍 True Specialty</button>
+                <button class="btn small ghost" onClick={() => applyVerdict(v, 'REJECT')}>⛔ Not Specialty</button>
                 <button class="btn small ghost" onClick={() => { gateCandidate(v.name, v.address); tab.value = 'gate'; }}>Run the Gate</button>
                 <button class="btn small ghost" onClick={() => goAudit(v.name)}>Begin Audit</button>
               </div>

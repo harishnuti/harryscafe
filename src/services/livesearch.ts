@@ -7,7 +7,7 @@ const FIELD_MASK = 'places.id,places.displayName,places.formattedAddress,places.
 
 interface RawPlace { id: string; displayName?: { text: string }; formattedAddress?: string; location?: { latitude: number; longitude: number }; rating?: number; userRatingCount?: number; currentOpeningHours?: { openNow?: boolean }; primaryType?: string; types?: string[]; reviews?: { text?: { text: string } }[]; websiteUri?: string }
 
-export interface MatchedKeyword { word: string; score: number; }
+export interface MatchedKeyword { word: string; score: number; source: 'review' | 'menu'; snippet?: string; }
 
 export interface ScoreBreakdown {
   base: number;
@@ -36,17 +36,18 @@ export interface LiveResult {
   scoreBreakdown: ScoreBreakdown;
   originLat: number | null;
   originLng: number | null;
+  verdict?: 'REJECT' | 'APPROVE';
 }
 
 export interface ArchiveRow { Cafe_Name: string; Grinder?: string; Origin?: string; Process?: string; Brew_Method?: string; Varietal?: string; star?: boolean; }
-export interface LiveSearchOpts { apiKey: string; areaText: string; radiusM: number; keywords: string[]; lat: number | null; lng: number | null; filterCoffeeRequired?: boolean; archive: ArchiveRow[] }
+export interface LiveSearchOpts { apiKey: string; areaText: string; radiusM: number; keywords: string[]; lat: number | null; lng: number | null; filterCoffeeRequired?: boolean; archive: ArchiveRow[]; verdicts?: Record<string, any>; }
 export interface LiveSearchOutcome { results: LiveResult[]; failedKeywords: string[]; requestCount: number; dnaKeywords: string[] }
 
 export class PlacesError extends Error {
   constructor(public kind: 'KEY_MISSING'|'KEY_INVALID'|'KEY_REFERRER'|'QUOTA'|'NET', msg: string) { super(msg); }
 }
 
-const COFFEE_WORDS = /\b(coffee|espresso|latte|flat white|barista|brew|beans?|roast|cappuccino|long black|americano|mocha|cuppa|kopi)\b/i;
+export const COFFEE_WORDS = /\b(coffee|espresso|latte|flat white|barista|brew|beans?|roast|cappuccino|long black|americano|mocha|cuppa|kopi)\b/i;
 
 export function coffeeMentionScore(reviews: string[]): number {
   if (reviews.length === 0) return 0;
@@ -139,9 +140,53 @@ export function extractDna(archive: ArchiveRow[], topN = 4): string[] {
     .map(([t]) => t);
 }
 
+export function extractContextualMatches(text: string, keywords: string[]): { word: string, snippet: string }[] {
+  const matches: { word: string, snippet: string }[] = [];
+  const lowerText = text.toLowerCase();
+  
+  for (const kw of keywords) {
+    const isAmbiguous = ['filter', 'natural', 'washed', 'honey'].includes(kw);
+    const isBoundaryNeeded = ['masl'].includes(kw) || isAmbiguous;
+    
+    let matchIdx = -1;
+    
+    if (isAmbiguous) {
+      const contextRegex = new RegExp(`\\b(coffee|roast|beans|brew|cup|menu|v60|pourover|specialty|process)\\W+(?:\\w+\\W+){0,6}${kw}\\b|\\b${kw}\\W+(?:\\w+\\W+){0,6}(coffee|roast|beans|brew|cup|menu|v60|pourover|specialty|process)\\b`, 'i');
+      
+      let isValid = contextRegex.test(text);
+      if (kw === 'filter' && isValid) {
+        if (/\bfilter(ed)? water\b/i.test(text) || /\bfilter(ing)? (something )?out\b/i.test(text)) {
+          isValid = false;
+        }
+      }
+      
+      if (isValid) {
+        const m = text.match(contextRegex);
+        if (m) matchIdx = m.index!;
+      }
+    } else if (isBoundaryNeeded) {
+      const m = text.match(new RegExp(`\\b${kw}\\b`, 'i'));
+      if (m) matchIdx = m.index!;
+    } else {
+      matchIdx = lowerText.indexOf(kw.toLowerCase());
+    }
+
+    if (matchIdx !== -1) {
+      const start = Math.max(0, matchIdx - 40);
+      const end = Math.min(text.length, matchIdx + kw.length + 40);
+      let snippet = text.slice(start, end).replace(/\s+/g, ' ').trim();
+      if (start > 0) snippet = '...' + snippet;
+      if (end < text.length) snippet = snippet + '...';
+      matches.push({ word: kw, snippet });
+    }
+  }
+  return matches;
+}
+
 export function scorePlace(raw: RawPlace, matched: string[], opts: {
   evidenceKeywords: string[]; archive: ArchiveRow[]; totalWeight: number;
   filterCoffeeRequired: boolean; originLat: number|null; originLng: number|null;
+  verdicts?: Record<string, any>;
 }): LiveResult | null {
   const normName = raw.displayName?.text?.toLowerCase() || '';
   const rawReviews = raw.reviews?.map(r => r.text?.text ?? '').filter(Boolean) ?? [];
@@ -160,36 +205,34 @@ export function scorePlace(raw: RawPlace, matched: string[], opts: {
     tierBadge = '⭐ Personally Audited';
     tierReason = `Found in your master archive`;
     evidenceScore = archived.star ? 0.55 : 0.45;
-    matchedKws.push({ word: "Master Audit Log", score: evidenceScore });
+    matchedKws.push({ word: "Master Audit Log", score: evidenceScore, source: 'review' });
+  }
+  
+  const verdict = opts.verdicts?.[raw.id]?.verdict;
+  if (verdict === 'APPROVE') {
+    if (tier !== 'T0') {
+      tier = 'T0';
+      tierBadge = '👍 Confirmed Gem';
+      tierReason = 'Manually approved by you';
+    }
+    evidenceScore = Math.max(evidenceScore, 0.40);
+    matchedKws.push({ word: "Manual Approval", score: 0.40, source: 'review' });
   }
 
   // T2/T3: Review and Roaster Scan
   if (tier === 'UNVERIFIED' && rawReviews.length > 0) {
     const combinedText = rawReviews.join(' ').toLowerCase();
-    for (const kw of opts.evidenceKeywords) {
-      const isWordBoundaryNeeded = ['filter', 'masl'].includes(kw);
-      let found = false;
-      if (kw === 'filter') {
-        found = /\bfilter\b/i.test(combinedText) && 
-                !/\bfilter(ed)? water\b/i.test(combinedText) && 
-                !/\bfilter(ing)? (something )?out\b/i.test(combinedText) &&
-                /\b(coffee|roast|beans|brew|cup|menu|v60|pourover|specialty)\W+(?:\w+\W+){0,6}filter\b|\bfilter\W+(?:\w+\W+){0,6}(coffee|roast|beans|brew|cup|menu|v60|pourover|specialty)\b/i.test(combinedText);
-      } else if (isWordBoundaryNeeded) {
-        found = new RegExp(`\\b${kw}\\b`, 'i').test(combinedText);
+    const ctxMatches = extractContextualMatches(combinedText, opts.evidenceKeywords);
+    
+    for (const { word: kw, snippet } of ctxMatches) {
+      const scoreBump = matchedKws.length === 0 ? 0.25 : 0.10;
+      if (evidenceScore < 0.40) {
+        const actualBump = Math.min(scoreBump, 0.40 - evidenceScore);
+        evidenceScore += actualBump;
+        const isDna = !['pour over', 'pourover', 'v60', 'filter', 'batch brew', 'hand brew', 'chemex', 'origami', 'aeropress', 'flat burr', 'masl', 'roasted in house'].includes(kw);
+        matchedKws.push({ word: isDna ? `${kw} (Palate DNA)` : kw, score: actualBump, source: 'review', snippet });
       } else {
-        found = combinedText.includes(kw.toLowerCase());
-      }
-
-      if (found) {
-        const scoreBump = matchedKws.length === 0 ? 0.25 : 0.10;
-        if (evidenceScore < 0.40) {
-          const actualBump = Math.min(scoreBump, 0.40 - evidenceScore);
-          evidenceScore += actualBump;
-          const isDna = !['pour over', 'pourover', 'v60', 'filter', 'batch brew', 'hand brew', 'chemex', 'origami', 'aeropress', 'flat burr', 'masl', 'roasted in house'].includes(kw);
-          matchedKws.push({ word: isDna ? `${kw} (Palate DNA)` : kw, score: actualBump });
-        } else {
-          matchedKws.push({ word: kw, score: 0 });
-        }
+        matchedKws.push({ word: kw, score: 0, source: 'review', snippet });
       }
     }
     if (matchedKws.length > 0) {
@@ -260,7 +303,8 @@ export function scorePlace(raw: RawPlace, matched: string[], opts: {
     placeId: raw.id, name: raw.displayName?.text ?? 'Unnamed', address: raw.formattedAddress ?? '',
     lat, lng, rating, reviews: n, openNow: raw.currentOpeningHours?.openNow ?? null,
     primaryType: raw.primaryType ?? '', score: Math.round(score * 100), matched, distanceM, foodHeavy,
-    tier, tierBadge, tierReason, rawReviews, websiteUri: raw.websiteUri, scoreBreakdown, originLat: opts.originLat, originLng: opts.originLng
+    tier, tierBadge, tierReason, rawReviews, websiteUri: raw.websiteUri, scoreBreakdown, originLat: opts.originLat, originLng: opts.originLng,
+    verdict
   };
 }
 
@@ -341,7 +385,7 @@ export async function liveAreaSearch(o: LiveSearchOpts): Promise<LiveSearchOutco
   for (const { raw, matched } of map.values()) {
     const result = scorePlace(raw, matched, {
       evidenceKeywords, archive: o.archive, totalWeight, 
-      filterCoffeeRequired: o.filterCoffeeRequired || false, originLat, originLng
+      filterCoffeeRequired: o.filterCoffeeRequired || false, originLat, originLng, verdicts: o.verdicts
     });
     if (result) out.push(result);
   }
@@ -352,6 +396,10 @@ export async function liveAreaSearch(o: LiveSearchOpts): Promise<LiveSearchOutco
 }
 
 export function sortLiveResults(a: LiveResult, b: LiveResult) {
+  // Blocked places go at the absolute bottom
+  if (a.verdict === 'REJECT' && b.verdict !== 'REJECT') return 1;
+  if (b.verdict === 'REJECT' && a.verdict !== 'REJECT') return -1;
+  
   const tierRank = { 'T0': 0, 'T1': 1, 'T2': 2, 'T3': 3, 'UNVERIFIED': 4 };
   const tierA = tierRank[a.tier];
   const tierB = tierRank[b.tier];
@@ -360,7 +408,7 @@ export function sortLiveResults(a: LiveResult, b: LiveResult) {
   return a.distanceM - b.distanceM;
 }
 
-export const menuEvidenceRegex = /v60|kalita|origami|orea|april|chemex|pour ?over|hand ?brew|filter (coffee|menu)|single origin|gesha|geisha|anaerobic|washed|natural|roast(ed)? (date|in\.?house)|brew bar|manual brew|slow bar/i;
+export const menuEvidenceKeywords = ['v60', 'kalita', 'origami', 'orea', 'april', 'chemex', 'pour over', 'pourover', 'hand brew', 'filter', 'single origin', 'gesha', 'geisha', 'anaerobic', 'washed', 'natural', 'honey', 'roast date', 'roasted in house', 'brew bar', 'manual brew', 'slow bar'];
 
 export async function upgradeT1(results: LiveResult[]): Promise<LiveResult[]> {
   const verified = results.filter(r => r.tier !== 'T0' && r.tier !== 'UNVERIFIED' && r.websiteUri).slice(0, 6);
@@ -386,28 +434,53 @@ export async function upgradeT1(results: LiveResult[]): Promise<LiveResult[]> {
       }
 
       if (text) {
-        const match = text.match(menuEvidenceRegex);
-        if (match) {
+        // Strip out HTML tags for accurate context matching
+        const cleanText = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+        const menuMatches = extractContextualMatches(cleanText, menuEvidenceKeywords);
+        
+        if (menuMatches.length > 0) {
           const idx = upgraded.findIndex(r => r.placeId === c.placeId);
           if (idx !== -1) {
             const old = upgraded[idx];
-            const oldScore = old.scoreBreakdown.evidenceScore;
-            // T1 overrides with 0.50 evidence score
-            const newScoreBreakdown = {
-              ...old.scoreBreakdown,
-              evidenceScore: 0.50,
-              totalBeforeCap: old.scoreBreakdown.totalBeforeCap - oldScore + 0.50
-            };
-            const finalScore = Math.max(0, Math.min(1, newScoreBreakdown.totalBeforeCap));
-            upgraded[idx] = {
-              ...old,
-              tier: 'T1',
-              tierBadge: '📜 Menu-Verified',
-              tierReason: `Menu lists: ${match[0]}`,
-              score: Math.round(finalScore * 100),
-              scoreBreakdown: newScoreBreakdown
-            };
-            changed = true;
+            
+            // Coherence Gate: Requires coffee mention >= 0.4 or positive lexicon
+            const ratio = old.rawReviews.length > 0
+              ? old.rawReviews.filter(r => COFFEE_WORDS.test(r)).length / old.rawReviews.length 
+              : null;
+            const passedCoherence = ratio === null ? true : ratio >= 0.4 || old.scoreBreakdown.lexiconScore > 0;
+            
+            if (passedCoherence) {
+              const oldScore = old.scoreBreakdown.evidenceScore;
+              
+              // Count unique words
+              const uniqueWords = new Set(menuMatches.map(m => m.word));
+              const isT1 = uniqueWords.size >= 2;
+              
+              const newEvidenceScore = isT1 ? 0.50 : 0.30;
+              
+              if (newEvidenceScore > oldScore) {
+                const newScoreBreakdown = {
+                  ...old.scoreBreakdown,
+                  evidenceScore: newEvidenceScore,
+                  totalBeforeCap: old.scoreBreakdown.totalBeforeCap - oldScore + newEvidenceScore,
+                  matchedKeywords: [
+                    ...old.scoreBreakdown.matchedKeywords,
+                    ...menuMatches.map(m => ({ word: m.word, score: 0, source: 'menu' as const, snippet: m.snippet }))
+                  ]
+                };
+                
+                const finalScore = Math.max(0, Math.min(1, newScoreBreakdown.totalBeforeCap));
+                upgraded[idx] = {
+                  ...old,
+                  tier: isT1 ? 'T1' : 'T2',
+                  tierBadge: isT1 ? '📜 Menu-Verified' : '📄 Menu Hint',
+                  tierReason: `Menu lists: ${[...uniqueWords].join(', ')}`,
+                  score: Math.round(finalScore * 100),
+                  scoreBreakdown: newScoreBreakdown
+                };
+                changed = true;
+              }
+            }
           }
         }
       }
